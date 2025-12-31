@@ -1197,3 +1197,85 @@ const port = Number(process.env.PORT) || 3939;
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
 });
+// Utility endpoint: returns aggregated storage capacity and occupied counts
+app.post("/utility", authenticateToken, async (req, res) => {
+    try {
+        const { mail } = req.body;
+        if (!mail) {
+            return res.status(400).json({ error: "mail is required" });
+        }
+
+        const { data: user, error: userErr } = await supabase
+            .from("user")
+            .select("user_id")
+            .eq("email", mail)
+            .maybeSingle();
+
+        if (userErr) {
+            console.error("Utility: error fetching user:", userErr);
+            return res.status(500).json({ error: "Database error fetching user" });
+        }
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        // fetch warehouses for user
+        const { data: warehouses, error: whErr } = await supabase
+            .from("warehouse")
+            .select("id, storage_capacity, name, location")
+            .eq("user_id", user.user_id);
+
+        if (whErr) {
+            console.error("Utility: error fetching warehouses:", whErr);
+            return res.status(500).json({ error: "Database error fetching warehouses" });
+        }
+
+        const totalCapacity = (warehouses || []).reduce((acc, w) => {
+            const cap = w.storage_capacity ?? 0;
+            return acc + (typeof cap === "number" ? cap : Number(cap) || 0);
+        }, 0);
+
+        const warehouseIds = (warehouses || []).map((w) => w.id).filter(Boolean);
+
+        let totalOccupied = 0;
+        // build per-warehouse occupied counts
+        const occupiedByWarehouse = {};
+        if (warehouseIds.length > 0) {
+            const { data: batches, error: batchesErr } = await supabase
+                .from("batches")
+                .select("number_of_batches, warehouse_id")
+                .in("warehouse_id", warehouseIds);
+
+            if (batchesErr) {
+                console.error("Utility: error fetching batches:", batchesErr);
+                return res.status(500).json({ error: "Database error fetching batches" });
+            }
+
+            for (const b of batches || []) {
+                const wid = b.warehouse_id;
+                const q = b.number_of_batches ?? 0;
+                const n = typeof q === "number" ? q : Number(q) || 0;
+                occupiedByWarehouse[wid] = (occupiedByWarehouse[wid] || 0) + n;
+                totalOccupied += n;
+            }
+        }
+
+        // attach occupied counts to warehouses array
+        const warehousesWithOccupied = (warehouses || []).map((w) => ({
+            ...w,
+            occupied: occupiedByWarehouse[w.id] || 0,
+        }));
+
+        const utilizationPercent = totalCapacity > 0 ? (totalOccupied / totalCapacity) * 100 : 0;
+
+        return res.status(200).json({
+            warehouses: warehousesWithOccupied,
+            totalCapacity,
+            totalOccupied,
+            utilizationPercent,
+        });
+    } catch (e) {
+        console.error("Unexpected error in /utility:", e);
+        return res.status(500).json({ error: "Server error" });
+    }
+});
